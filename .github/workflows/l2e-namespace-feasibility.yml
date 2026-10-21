@@ -1,0 +1,233 @@
+name: L2E image-free namespace feasibility — review draft
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: l2e-image-free-isolation
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    if: github.event_name == 'workflow_dispatch' && github.run_attempt == '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Source-free namespace primitive probe
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          export PATH=/usr/bin:/bin
+          for tool in sudo env timeout unshare setpriv python3; do
+            command -v "$tool" >/dev/null || {
+              echo "::error::BLOCKED: required tool unavailable"
+              exit 1
+            }
+          done
+          unshare --version
+          setpriv --version
+          python3 --version
+          env -i PATH=/usr/bin:/bin python3 -I -S - <<'PY'
+          import errno
+          import hashlib
+          import json
+          import os
+          import re
+          import socket
+          import subprocess
+          import sys
+          import uuid
+
+          BASE = r'''
+          import errno, json, os, socket, sys
+          cfg = json.loads(sys.argv[1])
+
+          def require(condition, message):
+              if not condition:
+                  raise RuntimeError(message)
+
+          def measure():
+              namespace = os.readlink("/proc/self/ns/net")
+              require(namespace != cfg["host_namespace"], "Namespace unchanged")
+              require(os.getuid() == 65534 and os.geteuid() == 65534, "UID")
+              require(os.getgid() == 65534 and not os.getgroups(), "Groups")
+              with open("/proc/self/status") as f:
+                  status = dict(line.split(":", 1) for line in f if ":" in line)
+              caps = {k: int(status[k].strip(), 16) for k in
+                      ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")}
+              require(all(v == 0 for v in caps.values()), "Capabilities remain")
+              nnp = int(status["NoNewPrivs"].strip())
+              require(nnp == 1, "NoNewPrivs missing")
+              interfaces = [name for _, name in socket.if_nameindex()]
+              require(interfaces == ["lo"], "Unexpected interface")
+              with open("/proc/self/net/route") as f:
+                  routes4 = [line.split()[0] for line in f.read().splitlines()[1:]]
+              with open("/proc/self/net/ipv6_route") as f:
+                  routes6 = [line.split()[-1] for line in f.read().splitlines()]
+              require(all(x == "lo" for x in routes4 + routes6), "Unexpected route")
+              stdio = {}
+              for entry in os.listdir("/proc/self/fd"):
+                  try:
+                      target = os.readlink("/proc/self/fd/" + entry)
+                  except FileNotFoundError:
+                      continue
+                  require(entry in ("0", "1", "2"), "Extra descriptor")
+                  require((entry == "0" and target == "/dev/null") or
+                          (entry in ("1", "2") and
+                           re_pipe(target)), "Unexpected stdio handle")
+                  stdio[entry] = "null" if entry == "0" else "pipe"
+              require(stdio == {"0": "null", "1": "pipe", "2": "pipe"}, "Stdio missing")
+              require(not any(k.upper().endswith("_PROXY") or k in
+                      ("SSH_AUTH_SOCK", "DBUS_SESSION_BUS_ADDRESS")
+                      for k in os.environ), "Proxy/broker environment")
+              observations = []
+              allowed = {errno.ENETUNREACH, errno.ENETDOWN,
+                         errno.EHOSTUNREACH, errno.ECONNREFUSED,
+                         errno.EADDRNOTAVAIL}
+              for family, address, port in cfg["canaries"]:
+                  with socket.socket(family, socket.SOCK_STREAM) as s:
+                      s.settimeout(1)
+                      try:
+                          s.connect((address, port))
+                      except OSError as error:
+                          require(error.errno in allowed, "Ambiguous socket failure")
+                          observations.append({"family": family, "errno": error.errno})
+                      else:
+                          raise RuntimeError("Unexpected canary access")
+              return {"namespace": namespace, "uid": os.getuid(),
+                      "gid": os.getgid(), "groups": os.getgroups(),
+                      "pid": os.getpid(), "caps": caps, "nnp": nnp,
+                      "stdio": stdio, "interfaces": interfaces,
+                      "routes4": routes4, "routes6": routes6,
+                      "socket_observations": observations}
+
+          def re_pipe(target):
+              return target.startswith("pipe:[") and target.endswith("]") and \
+                     target[6:-1].isdigit()
+          '''
+          child_code = BASE + "\nprint(json.dumps(measure()))\n"
+          parent_code = BASE + f'''
+          import subprocess
+          parent = measure()
+          child = subprocess.run(
+              [sys.executable, "-I", "-S", "-c", {child_code!r}, sys.argv[1]],
+              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+              stderr=subprocess.PIPE, env={{"PATH": "/usr/bin:/bin"}},
+              cwd="/", close_fds=True, timeout=5, text=True, check=True)
+          observed_child = json.loads(child.stdout)
+          require(observed_child["namespace"] == parent["namespace"], "Child namespace")
+          require(observed_child["pid"] != parent["pid"], "Child PID")
+          print(json.dumps({{"probe_id": cfg["probe_id"], "parent": parent,
+              "child": observed_child, "application_isolation_qualified": False}}))
+          '''
+
+          def require(condition, message):
+              if not condition:
+                  raise RuntimeError(message)
+
+          def validate_result(payload, cfg):
+              require(type(payload) is dict and set(payload) ==
+                      {"probe_id", "parent", "child", "application_isolation_qualified"},
+                      "Evidence envelope")
+              require(payload["probe_id"] == cfg["probe_id"] and
+                      payload["application_isolation_qualified"] is False,
+                      "Evidence scope or identity")
+              keys = {"namespace", "uid", "gid", "groups", "pid", "caps", "nnp",
+                      "stdio", "interfaces", "routes4", "routes6", "socket_observations"}
+              for role in ("parent", "child"):
+                  item = payload[role]
+                  require(type(item) is dict and set(item) == keys, "Evidence fields")
+                  require(type(item["namespace"]) is str and
+                          re.fullmatch(r"net:\[\d+\]", item["namespace"]) and
+                          item["namespace"] != cfg["host_namespace"], "Namespace evidence")
+                  require(type(item["uid"]) is int and item["uid"] == 65534 and
+                          type(item["gid"]) is int and item["gid"] == 65534 and
+                          item["groups"] == [], "Identity evidence")
+                  require(type(item["pid"]) is int and item["pid"] > 0, "PID evidence")
+                  require(type(item["caps"]) is dict and set(item["caps"]) ==
+                          {"CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"} and
+                          all(type(v) is int and v == 0 for v in item["caps"].values()),
+                          "Capability evidence")
+                  require(type(item["nnp"]) is int and item["nnp"] == 1 and
+                          item["stdio"] == {"0": "null", "1": "pipe", "2": "pipe"} and
+                          item["interfaces"] == ["lo"], "Process evidence")
+                  require(all(type(item[k]) is list and
+                          all(x == "lo" for x in item[k]) for k in ("routes4", "routes6")),
+                          "Route evidence")
+                  obs = item["socket_observations"]
+                  require(type(obs) is list and len(obs) == len(cfg["canaries"]),
+                          "Socket evidence count")
+                  for observed, expected in zip(obs, cfg["canaries"]):
+                      require(type(observed) is dict and set(observed) == {"family", "errno"}
+                              and type(observed["family"]) is int
+                              and observed["family"] == expected[0]
+                              and type(observed["errno"]) is int
+                              and observed["errno"] in {
+                                  errno.ENETUNREACH, errno.ENETDOWN, errno.EHOSTUNREACH,
+                                  errno.ECONNREFUSED, errno.EADDRNOTAVAIL}, "Socket evidence")
+              require(payload["parent"]["namespace"] == payload["child"]["namespace"] and
+                      payload["parent"]["pid"] != payload["child"]["pid"], "Child evidence")
+
+          code_hash = hashlib.sha256(parent_code.encode("utf-8")).hexdigest()
+          listeners = []
+          try:
+              canaries = []
+              for family, address in ((socket.AF_INET, "127.0.0.1"),
+                                      (socket.AF_INET6, "::1")):
+                  listener = socket.socket(family, socket.SOCK_STREAM)
+                  listeners.append(listener)
+                  listener.bind((address, 0))
+                  listener.listen(2)
+                  port = listener.getsockname()[1]
+                  with socket.socket(family, socket.SOCK_STREAM) as s:
+                      s.settimeout(1)
+                      s.connect((address, port))
+                  canaries.append([int(family), address, port])
+              cfg = {"probe_id": uuid.uuid4().hex,
+                     "host_namespace": os.readlink("/proc/self/ns/net"),
+                     "canaries": canaries}
+              command = [
+                  "timeout", "--signal=KILL", "30s", "sudo", "-n", "--",
+                  "env", "-i", "PATH=/usr/bin:/bin",
+                  "timeout", "--signal=KILL", "20s",
+                  "unshare", "--net", "--fork", "--kill-child=SIGKILL",
+                  "setpriv", "--reuid=65534", "--regid=65534", "--clear-groups",
+                  "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all",
+                  "--no-new-privs", "/usr/bin/python3", "-I", "-S", "-c",
+                  parent_code, json.dumps(cfg)]
+              try:
+                  result = subprocess.run(command, stdin=subprocess.DEVNULL,
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                      env={"PATH": "/usr/bin:/bin"}, cwd="/", close_fds=True,
+                      start_new_session=True, timeout=35, text=True)
+              except subprocess.TimeoutExpired:
+                  print(json.dumps({"status": "BLOCKED", "reason": "Controller timeout",
+                      "cleanup": "UNVERIFIED", "probe_source_sha256": code_hash}))
+                  raise SystemExit(1)
+              if result.returncode != 0:
+                  print(json.dumps({"status": "BLOCKED", "exit_code": result.returncode,
+                      "reason": "Namespace/privilege probe failed", "cleanup": "UNVERIFIED",
+                      "probe_source_sha256": code_hash}))
+                  raise SystemExit(1)
+              require(len(result.stdout) <= 65536, "Unexpected evidence size")
+              observed = json.loads(result.stdout)
+              validate_result(observed, cfg)
+              print(json.dumps({"status": "NETWORK_PRIMITIVES_OBSERVED",
+                  "probe_source_sha256": code_hash,
+                  "positive_control_families": [item[0] for item in canaries],
+                  "observed": observed,
+                  "cleanup": "OWNED_COMMAND_AND_FIXED_CHILD_REAPED",
+                  "global_namespace_cleanup_verified": False,
+                  "typegen_authorized": False}))
+          except Exception as error:
+              print(json.dumps({"status": "BLOCKED", "reason": "Probe/evidence validation failed",
+                  "error_type": type(error).__name__, "cleanup": "UNVERIFIED",
+                  "probe_source_sha256": code_hash}))
+              raise SystemExit(1)
+          finally:
+              for listener in listeners:
+                  listener.close()
+          PY
